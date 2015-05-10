@@ -7,8 +7,18 @@ typedef struct {
 	uint32_t hi;
 	uint32_t c;
 } range;
+
+/* lzma imports */
+int lzma_easy_buffer_encode(int preset, int check, void *allocator,
+	const uint8_t *in, size_t in_size,
+	uint8_t *out, size_t *out_pos, size_t out_size);
+
+int lzma_stream_buffer_decode(uint64_t *memlimit, uint32_t flags,
+	void *allocator, const uint8_t *in, size_t *in_pos, size_t in_size,
+	uint8_t *out, size_t *out_pos, size_t out_size);
 ]]
 
+lzma = ffi.load "lzma"
 s32 = ffi.typeof "int32_t"
 u32 = ffi.typeof "uint32_t"
 s64 = ffi.typeof "int64_t"
@@ -133,11 +143,11 @@ class BitTreeModel
 		ctx = 1LL
 		while ctx < @kNumSyms
 			ctx += ctx + s64(@models[tonumber(ctx)]\decode(dec))
-		ctx - @kNumSyms
+		return tonumber(ctx - @kNumSyms)
 
 mag = (n) ->
 	m = 0
-	while n >= lshift(1, m)
+	while n >= lshift(1LL, m)
 		m += 1
 	m
 
@@ -171,9 +181,9 @@ class UExpModel
 		if m > 0
 			mtop = if m < @kMaxTop then m else @kMaxTop
 			v += v + s64(@top[mtop]\decode(dec))
-			for i = 1,m-1
+			for i = 1, tonumber(m-1)
 				v += v + s64(dec\decode(kProbMax / 2))
-		v - 1
+		return tonumber(v - 1)
 
 class SExpModel
 	new: (mag_base, sign_base, bits) =>
@@ -194,28 +204,6 @@ class SExpModel
 				return -absv
 		return absv
 
-xkxkx = ->
-	f = io.open 'coder.moon', 'r'
-	str = f\read '*a'
-	decomp = Buffer ''
-	comp = Buffer ''
-	coder = BinArithEncoder comp
-
-
-	model = BitTreeModel((-> BinShiftModel(4)), 8)
-	for i = 1,str\len!
-		model\encode(coder, ord(str\sub(i, i)))
-	coder\finish!
-
-	-- io.write comp\to_string! .. "\n"
-
-	model = BitTreeModel((-> BinShiftModel(4)), 8)
-	decoder = BinArithDecoder comp
-	for i = 1,str\len!
-		decomp\append(model\decode(decoder))
-	-- io.write decomp\to_string() .. "\n"
-	io.write "#decomp=#{decomp.data\len!}, #comp=#{comp.data\len!}, ratio=#{comp.data\len!/decomp.data\len!}\n"
-
 { :enum_names, :enum_values } = require "enums"
 
 class HistCoder
@@ -228,14 +216,22 @@ class HistCoder
 			@coder = BinArithDecoder @decomp
 		@strings = {} -- refs are held to this in the code stream by index. it
 		-- will be lzma'd along with some other crap separate to the code stream
+		@name_to_idx = {}
 
 		@last_eid = 0 -- hist entity id
 		@last_tag_eid = 0 -- tag entity id
 		@last_tag_step = 0
 		@last_tag_turn = 0
+		@last_turn_start = 1356998400 -- January 1, 2013 "Hearthstone Epoch" :P
+		@last_tag_ignore_damage = false
+		@last_time = 0.0
+		@expect_tag_options_played = 0
+
+		@action_depth = 0
 
 		default = -> BinShiftModel(4) -- lower => adapt faster
 		@m = {}
+		@m.hist_time = UExpModel(default, 31)
 		@m.hist_kind = BitTreeModel(default, 3) -- max 8 history kinds
 		@m.ntag = BitTreeModel(default, 6) -- max 63 tags per entity
 		@m.tag = BitTreeModel(default, 9) -- max 512 GameTag enum values
@@ -251,14 +247,19 @@ class HistCoder
 		@m.tag_turns_in_play = UExpModel(default, 11) -- max 2048 turns in play
 		@m.tag_turns_left = UExpModel(default, 4)
 		@m.tag_turn_delta = SExpModel(default, default, 4)
+		@m.tag_turn_start_delta = UExpModel(default, 31)
 		@m.tag_zone = BitTreeModel(default, 3)
+		@m.tag_zone_position = UExpModel(default, 4)
 		@m.tag_faction = BitTreeModel(default, 2)
 		@m.tag_resources = BitTreeModel(default, 4)
 		@m.tag_num_attacks = BitTreeModel(default, 3)
 		@m.tag_default_bool = default!
 		@m.tag_cost = UExpModel(default, 7) -- max 127 cost
+		@m.tag_damage = UExpModel(default, 31)
+		@m.tag_ignore_damage = default!
+		@m.tag_options_played_delta = SExpModel(default, default, 12)
 		@m.bnet_id = default!
-		@m.start_index = SExpModel(default, default, 32)
+		@m.start_index = SExpModel(default, default, 8)
 		@m.start_kind = BitTreeModel(default, 3)
 		@m.meta_ninfo = UExpModel(default, 12) -- idk
 		@m.meta_info = SExpModel(default, default, 32)
@@ -270,41 +271,62 @@ class HistCoder
 			@encode_hist(hist)
 
 	encode_hist: (hist) =>
-		kind_idx = enum_values.PowerHistoryKind[hist.kind]
+		{ :time, :kind, :data } = hist
+
+		dtime = time - @last_time
+		if dtime < 0
+			error("time has flown backwards")
+		dtime_ms = math.floor(dtime * 1000)
+		@last_time += dtime_ms / 1000
+		@m.hist_time\encode(@coder, dtime_ms)
+
+		kind_idx = enum_values.PowerHistoryKind[kind] - 1
 		@m.hist_kind\encode(@coder, kind_idx)
-		if hist.kind == "FULL_ENTITY" or hist.kind == "SHOW_ENTITY"
-			@encode_entity hist.data
-		elseif hist.kind == "HIDE_ENTITY"
-			@encode_hide hist.data
-		elseif hist.kind == "TAG_CHANGE"
-			@encode_change hist.data
-		elseif hist.kind == "CREATE_GAME"
-			@encode_create hist.data
-		elseif hist.kind == "POWER_START"
-			@encode_start hist.data
-		elseif hist.kind == "POWER_END"
-			@encode_end hist.data
-		elseif hist.kind == "META_DATA"
-			@encode_metadata hist.data
+		if kind == "FULL_ENTITY" or kind == "SHOW_ENTITY"
+			@encode_entity data
+		elseif kind == "HIDE_ENTITY"
+			@encode_hide data
+		elseif kind == "TAG_CHANGE"
+			@encode_change data
+		elseif kind == "CREATE_GAME"
+			@last_tag_turn = 0
+			@encode_create data
+		elseif kind == "POWER_START"
+			@encode_start data
+		elseif kind == "POWER_END"
+			@encode_end data
+		elseif kind == "META_DATA"
+			@encode_metadata data
 		else
-			error("bad hist.kind")
+			error("bad hist.kind: #{kind}")
 		return
 
 	encode_entity: (o) =>
-		if o.id and o.id ~= 0
-			@encode_eid(o.id)
+		if o.entity and o.entity ~= 0
+			@encode_eid(o.entity)
 		else
-			error("entity has no id?")
-		@encode_tags(o.tags, o.id <= 3)
+			error("entity has no id? (id = #{o.entity})")
+		@encode_tags(o.tags, o.entity <= 3)
 		name_index = 0
 		if o.name ~= nil
-			table.insert(@strings, o.name)
-			name_index = #@strings
+			name_index = @get_name_index(o.name)
 		@m.strid\encode(@coder, name_index)
 
+	get_name_index: (name) =>
+		if @name_to_idx[name] ~= nil
+			return @name_to_idx[name]
+
+		table.insert(@strings, name)
+		@name_to_idx[name] = #@strings
+		return #@strings
 
 	encode_tag: (name, value, is_special = false) =>
-		name_value = enum_values.GameTag[name]
+		local name_value
+		if type(name) == "string"
+			name_value = enum_values.GameTag[name]
+		else
+			name_value = name
+			name = ""
 		if is_special
 			@m.special_tag\encode(@coder, name_value)
 		else
@@ -337,6 +359,11 @@ class HistCoder
 				tag_value = enum_values.CARD_SET[value]
 			elseif name == "MULLIGAN_STATE"
 				tag_value = enum_values.MULLIGAN[value]
+
+		if name == "STEP" and tag_value == enum_values.STEP.MAIN_START
+			-- beginning of turn actions phase:
+			@expect_tag_options_played = 0
+
 		-- value:
 		if name == "HERO_ENTITY" or name == "ENTITY_ID" or name == "ATTACKING" or name == "DEFENDING"
 			delta = tag_value - @last_tag_eid
@@ -364,8 +391,14 @@ class HistCoder
 			delta = tag_value - @last_tag_turn
 			@last_tag_turn = tag_value
 			@m.tag_turn_delta\encode(@coder, delta)
+		elseif name == "TURN_START" -- unix timestamp
+			delta = tag_value - @last_turn_start
+			@last_turn_start = tag_value
+			@m.tag_turn_start_delta\encode(@coder, delta)
 		elseif name == "ZONE"
 			@m.tag_zone\encode(@coder, tag_value)
+		elseif name == "ZONE_POSITION"
+			@m.tag_zone_position\encode(@coder, tag_value)
 		elseif name == "FACTION"
 			@m.tag_faction\encode(@coder, tag_value)
 		elseif name == "RESOURCES"
@@ -374,10 +407,27 @@ class HistCoder
 			if tag_value >= 8
 				error("NUM_ATTACKS_THIS_TURN out of range")
 			@m.tag_num_attacks\encode(@coder, tag_value)
+		elseif name == "NUM_OPTIONS_PLAYED_THIS_TURN"
+			delta = tag_value - @expect_tag_options_played
+			@expect_tag_options_played = tag_value
+			@m.tag_options_played_delta\encode(@coder, delta)
 		elseif name == "COST"
 			@m.tag_cost\encode(@coder, tag_value)
+		elseif name == "PREDAMAGE" or name == "DAMAGE"
+			@m.tag_damage\encode(@coder, tag_value)
+		elseif name == "IGNORE_DAMAGE" -- these two are in a relationship
+			tag_bool = tag_value ~= 0
+			expect = not @last_tag_ignore_damage
+			@last_tag_ignore_damage = tag_bool
+			@m.tag_ignore_damage\encode(@coder, expect == tag_bool)
+		elseif name == "IGNORE_DAMAGE_OFF"
+			tag_bool = tag_value ~= 0
+			expect = @last_tag_ignore_damage
+			@m.tag_ignore_damage\encode(@coder, expect == tag_bool)
 		elseif @is_default_bool(name)
-			@m.tag_default_bool\encode(@coder, tag_value)
+			if tag_value > 1 or tag_value < 0
+				error("bool tag out of range")
+			@m.tag_default_bool\encode(@coder, tag_value ~= 0)
 		elseif @is_health_atk_like(name)
 			@m.tag_atkhp\encode(@coder, tag_value)
 		else
@@ -385,6 +435,7 @@ class HistCoder
 		return
 
 	is_default_bool: (n) =>
+		return false if type(n) ~= "string"
 		return true if n == "FIRST_PLAYER"
 		return true if n == "CURRENT_PLAYER"
 		return true if n == "EXHAUSTED"
@@ -425,12 +476,11 @@ class HistCoder
 
 	encode_hide: (o) =>
 		@encode_eid(o.entity)
-		@m.tag_zone\encode(@coder, o.zone)
+		zone_value = enum_values.ZONE[o.zone]
+		@m.tag_zone\encode(@coder, zone_value)
 
 	encode_change: (o) =>
-		delta = o.entity - @last_eid
-		@last_eid = o.entity
-		@m.eid_delta\encode(@coder, delta)
+		@encode_eid(o.entity)
 		@encode_tag(o.tag, o.value, o.entity <= 3)
 
 	encode_create: (o) =>
@@ -449,6 +499,10 @@ class HistCoder
 			@m.bnet_id\encode(@coder, band(lshift(1, i), w) ~= 0)
 
 	encode_start: (o) =>
+		if @action_depth == 0 and o.type == "PLAY"
+			@expect_tag_options_played += 1
+		@action_depth += 1
+
 		@m.start_kind\encode(@coder, enum_values.PowerHistoryStartType[o.type])
 		@m.start_index\encode(@coder, o.index)
 		@encode_eid(o.source)
@@ -457,13 +511,15 @@ class HistCoder
 		@m.tag_eid_delta\encode(@coder, delta)
 
 	encode_end: (o) =>
+		@action_depth -= 1
 		return -- just a tag
 
 	encode_metadata: (o) =>
 		@m.meta_ninfo\encode(@coder, #o.info)
 		for i=1,#o.info
 			@m.meta_info\encode(@coder, o.info[i])
-		@m.meta_type\encode(@coder, o.meta_type + 1)
+		meta_type = enum_values.PowerHistoryMetaType[o.meta_type]
+		@m.meta_type\encode(@coder, meta_type + 1)
 		@m.meta_data\encode(@coder, o.data)
 
 	-- (( Decoders ))
@@ -474,30 +530,201 @@ class HistCoder
 		result
 
 	decode_hist: =>
-		kind_idx = @m.hist_kind\decode(@decoder)
+		dtime_ms = @m.hist_time\decode(@coder)
+		dtime = dtime_ms / 1000
+		time = @last_time + dtime
+		@last_time = time
+
+		kind_idx = @m.hist_kind\decode(@coder) + 1
 		kind = enum_names.PowerHistoryKind[kind_idx]
+		local data
 		if kind == "FULL_ENTITY" or kind == "SHOW_ENTITY"
-			return @decode_entity!
+			data = @decode_entity!
 		elseif kind == "HIDE_ENTITY"
-			return @decode_hide!
+			data = @decode_hide!
 		elseif kind == "TAG_CHANGE"
-			return @decode_change!
+			data = @decode_change!
 		elseif kind == "CREATE_GAME"
-			return @decode_create!
+			data = @decode_create!
 		elseif kind == "POWER_START"
-			return @decode_start!
+			data = @decode_start!
 		elseif kind == "POWER_END"
-			return @decode_end!
+			data = @decode_end!
 		elseif kind == "META_DATA"
-			return @decode_metadata!
+			data = @decode_metadata!
 		else
-			error("bad hist.kind")
+			error("bad hist.kind: #{kind_idx}")
+		return { :time, :kind, :data }
 
 	decode_entity: =>
-		o = {}
-		o.id = @decode_eid
-		o.tags = @decode_tags(o.id <= 3)
-		name_index = @m.strid\decode(@decoder)
+		entity = @decode_eid!
+		tags = @decode_tags(entity <= 3)
+		name_index = @m.strid\decode(@coder)
+		local name
 		if name_index > 0
-			o.name = @strings[name_index]
-		return o
+			name = @strings[name_index]
+		return { :entity, :tags, :name }
+
+	decode_eid: =>
+		delta = @m.eid_delta\decode(@coder)
+		eid = @last_eid + delta
+		@last_eid = eid
+		if eid < -1
+			error("something has gone horribly wrong")
+		return eid
+
+	decode_tags: (is_special = false) =>
+		tags = {}
+		ntags = @m.ntag\decode(@coder)
+		for i = 1,ntags
+			table.insert(tags, @decode_tag(is_special))
+		return tags
+
+	decode_tag: (is_special = false) =>
+		local name_value
+		if is_special
+			name_value = @m.special_tag\decode(@coder)
+		else
+			name_value = @m.tag\decode(@coder)
+		name = enum_names.GameTag[name_value]
+		if name == nil
+			name = name_value
+
+		local tag_value
+		-- value:
+		if name == "HERO_ENTITY" or name == "ENTITY_ID" or name == "ATTACKING" or name == "DEFENDING"
+			delta = @m.tag_eid_delta\decode(@coder)
+			tag_value = @last_tag_eid + delta
+			@last_tag_eid = tag_value
+		elseif name == "CONTROLLER" or name == "TEAM_ID" or name == "PLAYER_ID"
+			tag_value = @m.tag_controller\decode(@coder)
+		elseif name == "MAXRESOURCES" or name == "MAXHANDSIZE" or name == "STARTHANDSIZE"
+			tag_value = @m.tag_10limits\decode(@coder)
+		elseif name == "NEXT_STEP" or name == "STEP"
+			delta = @m.tag_step_delta\decode(@coder)
+			tag_value = @last_tag_step + delta
+			@last_tag_step = delta
+		elseif name == "NUM_TURNS_IN_PLAY"
+			tag_value = @m.tag_turns_in_play\decode(@coder)
+		elseif name == "NUM_TURNS_LEFT"
+			tag_value = @m.tag_turns_left\decode(@coder)
+		elseif name == "TURN"
+			delta = @m.tag_turn_delta\decode(@coder)
+			tag_value = @last_tag_turn + delta
+			@last_tag_turn = tag_value
+		elseif name == "TURN_START" -- unix timestamp
+			delta = @m.tag_turn_start_delta\decode(@coder)
+			tag_value = @last_turn_start + delta
+			@last_turn_start = tag_value
+		elseif name == "ZONE"
+			tag_value = @m.tag_zone\decode(@coder)
+		elseif name == "ZONE_POSITION"
+			tag_value = @m.tag_zone_position\decode(@coder)
+		elseif name == "FACTION"
+			tag_value = @m.tag_faction\decode(@coder)
+		elseif name == "RESOURCES"
+			tag_value = @m.tag_resources\decode(@coder)
+		elseif name == "NUM_ATTACKS_THIS_TURN"
+			tag_value = @m.tag_num_attacks\decode(@coder)
+		elseif name == "NUM_OPTIONS_PLAYED_THIS_TURN"
+			delta = @m.tag_options_played_delta\decode(@coder)
+			tag_value = @expect_tag_options_played + delta
+			@expect_tag_options_played = tag_value
+		elseif name == "COST"
+			tag_value = @m.tag_cost\decode(@coder)
+		elseif name == "PREDAMAGE" or name == "DAMAGE"
+			tag_value = @m.tag_damage\decode(@coder)
+		elseif name == "IGNORE_DAMAGE"
+			expect = not @last_tag_ignore_damage
+			local tag_bool
+			if @m.tag_ignore_damage\decode(@coder)
+				tag_bool = expect
+			else
+				tag_bool = not expect
+			@last_tag_ignore_damage = tag_bool
+			tag_value = if tag_bool then 1 else 0
+		elseif name == "IGNORE_DAMAGE_OFF"
+			expect = @last_tag_ignore_damage
+			local tag_bool
+			if @m.tag_ignore_damage\decode(@coder)
+				tag_bool = expect
+			else
+				tag_bool = not expect
+			tag_value = if tag_bool then 1 else 0
+		elseif @is_default_bool(name)
+			tag_value = @m.tag_default_bool\decode(@coder)
+		elseif @is_health_atk_like(name)
+			tag_value = @m.tag_atkhp\decode(@coder)
+		else
+			tag_value = @m.tag_default\decode(@coder)
+
+		if name == "STEP" and tag_value == enum_values.STEP.MAIN_START
+			-- beginning of turn actions phase:
+			@expect_tag_options_played = 0
+
+		return { :name, value: tag_value }
+
+	decode_hide: =>
+		entity = @decode_eid!
+		zone = @m.tag_zone\decode(@coder)
+		return { :entity, :zone }
+
+	decode_change: =>
+		entity = @decode_eid!
+		{ :name, :value } = @decode_tag(entity <= 3)
+		return { :entity, tag: name, :value }
+
+	decode_create: =>
+		id = @decode_eid!
+		tags = @decode_tags(true)
+		game_entity = { :id, :tags }
+		players = {}
+		for i = 1,2
+			p = {}
+			p.id = @decode_eid!
+			p.gameAccountId = {
+				lo: @decode_bnet_id_word!
+				hi: @decode_bnet_id_word!
+			}
+			p.card_back = @m.tag_default\decode(@coder)
+			p.entity = {
+				id: @decode_eid!
+				tags: @decode_tags(true)
+			}
+			players[i] = p
+		return { :game_entity, :players }
+
+	decode_bnet_id_word: =>
+		word = 0LL
+		for i=63,0
+			word = bor(word, lshift(s64(@m.bnet_id\decode(@coder)), i))
+		return word
+
+	decode_start: =>
+		@action_depth += 1
+
+		type_value = @m.start_kind\decode(@coder)
+		index = @m.start_index\decode(@coder)
+		type_name = enum_names.PowerHistoryStartType[type_value]
+		if @action_depth == 1 and type_value == enum_values.PowerHistoryStartType.PLAY
+			@expect_tag_options_played += 1
+		source = @decode_eid!
+		delta = @m.tag_eid_delta\decode(@coder)
+		target = @last_tag_eid + delta
+		@last_tag_eid = target
+		return { type: type_name, :index, :source, :target }
+
+	decode_end: =>
+		@action_depth -= 1
+		return {}
+
+	decode_metadata: =>
+		ninfo = @m.meta_ninfo\decode(@coder)
+		info = {}
+		for i=1,ninfo
+			info[i] = @m.meta_info\decode(@coder)
+		meta_type = @m.meta_type\decode(@coder) - 1
+		meta_data = @m.meta_data\decode(@coder)
+		return { :info, :meta_type, :data }
+
+return { :HistCoder }
