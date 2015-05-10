@@ -124,13 +124,15 @@ class BinShiftModel
 
 class BitTreeModel
 	new: (base, bits) =>
-		@kNumSyms = lshift(1, bits)
+		@kNumSyms = lshift(1LL, bits)
 		@kMSB = rshift(@kNumSyms, 1)
 		@models = {}
-		for i = 1,@kNumSyms
+		for i = 1,tonumber(@kNumSyms)
 			@models[i] = base!
 
 	encode: (enc, value) =>
+		if value >= @kNumSyms or value < 0
+			error("BitTree overflowed: #{value} >< #{@kNumSyms}")
 		ctx = 1LL
 		while ctx < @kNumSyms
 			bit = band(value, @kMSB) ~= 0
@@ -153,6 +155,7 @@ mag = (n) ->
 
 class UExpModel
 	new: (base, bits) =>
+		@bits = bits
 		@mag = BitTreeModel(base, mag(bits - 1))
 		@kMaxTop = math.min(7, bits - 2)
 		@top = {}
@@ -161,6 +164,8 @@ class UExpModel
 
 	encode: (enc, value) =>
 		value += 1
+		if value >= lshift(1LL, @bits) or value <= 0
+			error("UExp overflowed")
 		m = mag(value) - 1
 		@mag\encode(enc, m)
 
