@@ -603,7 +603,7 @@ class HistCoder
 		elseif name == "NEXT_STEP" or name == "STEP"
 			delta = @m.tag_step_delta\decode(@coder)
 			tag_value = @last_tag_step + delta
-			@last_tag_step = delta
+			@last_tag_step = tag_value
 		elseif name == "NUM_TURNS_IN_PLAY"
 			tag_value = @m.tag_turns_in_play\decode(@coder)
 		elseif name == "NUM_TURNS_LEFT"
